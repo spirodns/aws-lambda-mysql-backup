@@ -1,0 +1,182 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: An AWS Lambda application that runs backup for RDS db
+Parameters:
+  DbHost:
+    Type: String
+    Description: RDS DB host address
+    Default:
+  DbUsername:
+    Type: String
+    Description: RDS DB host root username
+    Default: root
+  ParameterStoreSecret:
+    Type: String
+    Description: RDS DB host root password
+    Default:
+  Database:
+    Type: String
+    Description: databases to backup
+    Default:
+  BucketName:
+    Type: String
+    Description: The S3 bucket used to store dump
+    Default:
+  Region:
+    Type: String
+    Description: AWS region
+    Default: us-west-1
+  CronjobRule:
+    Type: String
+    Description: Schedule rule for the function
+    Default: "cron(0 1 * * ? *)"
+  RDSSubnetIdA:
+    Type: String
+    Description: one of the subnet in which RDS resides
+    Default:
+  RDSSubnetIdB:
+    Type: String
+    Description: one of the subnet in which RDS resides
+    Default:
+  RouteTableA:
+    Type: String
+    Description: one of the routing tables for RDS
+    Default:
+  RouteTableB:
+    Type: String
+    Description: one of the routing tables for RDS
+    Default:
+  DefaultSecurityGroupId:
+    Type: String
+    Description: default VPC security group
+    Default:
+  RDSSecurityGroupId:
+    Type: String
+    Description: RDS security group
+    Default:
+  VPCID:
+    Type: String
+    Description: VPC ID in which RDS resides
+    Default:
+Resources:
+  function:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: lambda_function.lambda_handler
+      Runtime: python3.8
+      CodeUri: 
+      Description: Backup RDS and store to S3
+      Environment:
+        Variables:
+          DB_HOST: !Ref DbHost
+          DB_USERNAME: !Ref DbUsername
+          SECRET: !Ref ParameterStoreSecret
+          DATABASE: !Ref Database
+          BUCKET: !Ref BucketName
+          REGION: !Ref Region
+      Timeout: 330
+      Policies:
+      - AmazonRDSDataFullAccess
+      - AmazonS3FullAccess
+      - AmazonSSMReadOnlyAccess
+      Layers:
+      - Ref: libs
+      VpcConfig:
+        SecurityGroupIds:
+        - !Ref DefaultSecurityGroupId
+        - !Ref RDSSecurityGroupId
+        SubnetIds:
+        - !Ref RDSSubnetIdA
+        - !Ref RDSSubnetIdB
+  libs:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: lib
+      Description: Dependencies for the app.
+      ContentUri: 
+      CompatibleRuntimes:
+      - provided.al2
+  BackupS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketName
+      AccessControl: Private
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: Daily
+            Prefix: daily/
+            Status: Enabled
+            ExpirationInDays: '30'
+            Transitions:
+              - TransitionInDays: '7'
+                StorageClass: GLACIER
+          - Id: Weekly
+            Prefix: weekly/
+            Status: Enabled
+            ExpirationInDays: '180'
+            Transitions:
+              - TransitionInDays: '30'
+                StorageClass: GLACIER
+          - Id: Monthly
+            Prefix: monthly/
+            Status: Enabled
+            ExpirationInDays: '730'
+            Transitions:
+              - TransitionInDays: '365'
+                StorageClass: GLACIER
+  S3Endpoint:
+    Type: 'AWS::EC2::VPCEndpoint'
+    Properties:
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: '*'
+            Resource: '*'
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref RouteTableA
+        - !Ref RouteTableB
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcId: !Ref VPCID
+  SSMEndpoint:
+    Type: 'AWS::EC2::VPCEndpoint'
+    Properties:
+      PrivateDnsEnabled: true
+      VpcEndpointType: Interface
+      SecurityGroupIds:
+        - !Ref DefaultSecurityGroupId
+      SubnetIds:
+        - !Ref RDSSubnetIdA
+        - !Ref RDSSubnetIdB
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssm'
+      VpcId: !Ref VPCID
+  ScheduledRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "ScheduledRule"
+      ScheduleExpression: !Ref CronjobRule
+      State: "ENABLED"
+      Targets:
+        - Arn:
+            Fn::GetAtt:
+              - "function"
+              - "Arn"
+          Id: "TargetFunctionV1"
+  PermissionForEventsToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName:
+        Ref: "function"
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn:
+        Fn::GetAtt:
+          - "ScheduledRule"
+          - "Arn"
